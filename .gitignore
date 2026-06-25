@@ -1,0 +1,21 @@
+# PyCharm
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# 虚拟环境
+.venv/
+
+# 数据（原始、清洗后、OD结果、缓存——全部体积大，不进代码仓库）
+data/raw/
+data/cleaned/
+data/od/
+data/cache/
+
+# 输出结果
+outputs/
+
+# Jupyter
+.ipynb_checkpoints/

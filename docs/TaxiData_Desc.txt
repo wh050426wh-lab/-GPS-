@@ -1,0 +1,2 @@
+Taxi GPS Data Format: 22223,2013-10-22 08:49:25,114.116631,22.582466,0
+Taxi ID, Time, Latitude, Longitude, Occupancy Status, Speed; Occupancy Status: 1-with passengers & 0-with passengers;

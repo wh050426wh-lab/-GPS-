@@ -1,0 +1,736 @@
+import os
+import sys
+
+import folium
+import pandas as pd
+import streamlit as st
+from streamlit_folium import st_folium
+import json
+import numpy as np
+import streamlit.components.v1 as components
+from folium.plugins import Draw
+from folium import MacroElement
+from jinja2 import Template
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from project_config import VEHICLE_CACHE_DIR, MINUTE_CACHE_DIR, SHENZHEN_BOUNDARY_FILE  # noqa: E402
+
+SHENZHEN_CENTER = [22.52847, 114.05454]
+DATA_DATE = '2013-10-22'
+
+MAX_VEHICLES_FOR_ANIMATION = 6
+MULTI_VEHICLE_COLORS = [
+    '#E63946', '#1d3557', '#2a9d8f', '#f4a261',
+    '#8338ec', '#fb8500', '#3a86ff', '#06D6A0',
+]
+
+
+# ── 数据加载 ──────────────────────────────────────────────────────────
+
+@st.cache_data
+def list_vehicle_ids():
+    files = [f.replace('.csv', '') for f in os.listdir(VEHICLE_CACHE_DIR) if f.endswith('.csv')]
+    return sorted(files, key=lambda x: int(x))
+
+
+@st.cache_data
+def load_vehicle_data(vehicle_id):
+    file_path = os.path.join(VEHICLE_CACHE_DIR, f'{vehicle_id}.csv')
+    df = pd.read_csv(file_path, parse_dates=['time'])
+    return df.sort_values(by='time').reset_index(drop=True)
+
+
+@st.cache_data
+def load_minute_snapshot(hour, minute):
+    minute_str = f'{hour:02d}-{minute:02d}'
+    file_path = os.path.join(MINUTE_CACHE_DIR, f'{minute_str}.csv')
+    if not os.path.exists(file_path):
+        return pd.DataFrame()
+    return pd.read_csv(file_path, parse_dates=['time'])
+
+
+@st.cache_data
+def load_shenzhen_boundary():
+    with open(SHENZHEN_BOUNDARY_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+# ── 公共地图工具 ───────────────────────────────────────────────────────
+
+def add_boundary_to_map(target, boundary_geojson):
+    folium.GeoJson(
+        boundary_geojson,
+        name='深圳市边界',
+        style_function=lambda feature: {
+            'fillColor': 'transparent',
+            'color': '#3388ff',
+            'weight': 3.5,
+            'fillOpacity': 0,
+            'dashArray': '5, 5',
+        },
+        tooltip=folium.GeoJsonTooltip(fields=['name'], aliases=['区域：']),
+    ).add_to(target)
+    return target
+
+
+def add_road_match_banner(m, enabled):
+    if not enabled:
+        return m
+    banner_html = '''
+    <div style="position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:9999;
+                background:#FFF3CD;color:#664d03;padding:6px 16px;
+                border:1px solid #ffe69c;border-radius:6px;font-size:13px;
+                box-shadow:0 1px 4px rgba(0,0,0,0.15);">
+        ⚠️ 路网校正：功能开发中，当前显示原始GPS轨迹（未做道路匹配）
+    </div>'''
+    m.get_root().html.add_child(folium.Element(banner_html))
+    return m
+
+
+def extract_bbox_from_drawing(drawing):
+    if not drawing:
+        return None
+    geometry = drawing.get('geometry', {})
+    if geometry.get('type') != 'Polygon':
+        return None
+    coords = geometry.get('coordinates', [[]])[0]
+    if len(coords) < 3:
+        return None
+    lngs = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    return min(lats), max(lats), min(lngs), max(lngs)
+
+
+def filter_by_bbox(df, bbox):
+    if bbox is None or len(df) == 0:
+        return df
+    south, north, west, east = bbox
+    return df[
+        (df['lati'] >= south) & (df['lati'] <= north) &
+        (df['long'] >= west) & (df['long'] <= east)
+    ]
+
+
+def find_nearest_vehicle(df, click_lat, click_lng):
+    if len(df) == 0:
+        return None
+    distances = np.sqrt((df['lati'] - click_lat) ** 2 + (df['long'] - click_lng) ** 2)
+    return df.loc[distances.idxmin()]
+
+
+# ── Tab 1：全车位置快照 ────────────────────────────────────────────────
+
+class CanvasDotsLayer(MacroElement):
+    """
+    用 MacroElement 把 Canvas 绘点脚本内嵌进 folium 生成的 HTML。
+    脚本与地图在同一文档，map 对象一定存在，无跨 iframe 时序问题。
+    载客红色 #E63946，空载绿色 #06D6A0。
+    支持图层控制面板开关（overlayadd/overlayremove）。
+    点击地图弹出最近车辆 popup。
+    """
+    _template = Template("""
+    {% macro script(this, kwargs) %}
+    (function(){
+        var PTS = {{ this.points_json }};
+        var mapObj = {{ this._parent.get_name() }};
+
+        /* Canvas Layer */
+        var showBusy = true, showIdle = true;
+        var cvs = document.createElement('canvas');
+        cvs.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;';
+        mapObj.getPanes().overlayPane.appendChild(cvs);
+
+        function redraw(){
+            var size = mapObj.getSize();
+            cvs.width  = size.x;
+            cvs.height = size.y;
+            var tl  = mapObj.containerPointToLayerPoint([0,0]);
+            cvs.style.left = tl.x + 'px';
+            cvs.style.top  = tl.y + 'px';
+            var ctx = cvs.getContext('2d');
+            ctx.clearRect(0, 0, cvs.width, cvs.height);
+            var zoom = mapObj.getZoom();
+            var r = Math.max(2, Math.min(6, zoom - 7));
+            for(var k=0; k<PTS.length; k++){
+                var p = PTS[k];
+                if(p.s===1 && !showBusy) continue;
+                if(p.s===0 && !showIdle) continue;
+                var pt = mapObj.latLngToContainerPoint([p.a, p.o]);
+                ctx.beginPath();
+                ctx.arc(pt.x, pt.y, r, 0, 2*Math.PI);
+                ctx.fillStyle = p.s===1 ? '#E63946' : '#06D6A0';
+                ctx.globalAlpha = 0.80;
+                ctx.fill();
+            }
+        }
+
+        mapObj.on('moveend zoomend resize viewreset', redraw);
+        redraw();
+
+        /* 图层控制联动 */
+        mapObj.on('overlayadd overlayremove', function(e){
+            if(e.name==='载客轨迹') showBusy = (e.type==='overlayadd');
+            if(e.name==='空载轨迹') showIdle = (e.type==='overlayadd');
+            redraw();
+        });
+
+        /* 点击弹出最近车辆 popup */
+        mapObj.on('click', function(e){
+            var clat=e.latlng.lat, clng=e.latlng.lng;
+            var best=null, bestD=Infinity;
+            var bounds=mapObj.getBounds();
+            for(var k=0;k<PTS.length;k++){
+                var p=PTS[k];
+                if(!bounds.contains([p.a,p.o])) continue;
+                var d=(p.a-clat)*(p.a-clat)+(p.o-clng)*(p.o-clng);
+                if(d<bestD){bestD=d;best=p;}
+            }
+            if(best){
+                L.popup()
+                 .setLatLng([best.a,best.o])
+                 .setContent(
+                    '<b>车辆id: '+best.i+'</b><br>'+
+                    '状态: '+(best.s===1?'🔴 载客':'🟢 空载')+'<br>'+
+                    '速度: '+best.v+' km/h'
+                 ).openOn(mapObj);
+            }
+        });
+    })();
+    {% endmacro %}
+    """)
+
+    def __init__(self, points_json):
+        super().__init__()
+        self._name = 'CanvasDotsLayer'
+        self.points_json = points_json
+
+
+def build_fleet_snapshot_map(df, highlight_row=None, bbox=None, enable_draw=True):
+    if len(df) == 0:
+        return None
+
+    map_center = ([highlight_row['lati'], highlight_row['long']]
+                  if highlight_row is not None else SHENZHEN_CENTER)
+    zoom = 14 if highlight_row is not None else 11
+
+    # prefer_canvas=True 让 Leaflet 用 Canvas renderer 处理矢量层，进一步减少 DOM 压力
+    m = folium.Map(location=map_center, zoom_start=zoom,
+                   tiles='OpenStreetMap', prefer_canvas=True)
+
+    # 两个空 FeatureGroup 仅用于图层控制面板显示开关，实际渲染由 CanvasDotsLayer 负责
+    folium.FeatureGroup(name='载客轨迹', show=True).add_to(m)
+    folium.FeatureGroup(name='空载轨迹', show=True).add_to(m)
+
+    # 序列化点数据（字段名缩短减少 JSON 体积）
+    records = df[['lati', 'long', 'status', 'id', 'speed']].copy()
+    records['id'] = records['id'].astype(int)
+    pts = [{'a': r.lati, 'o': r.long, 's': int(r.status),
+             'i': int(r.id), 'v': float(r.speed)}
+           for r in records.itertuples()]
+    points_json = json.dumps(pts)
+
+    # Canvas 绘点层内嵌进地图 HTML
+    CanvasDotsLayer(points_json).add_to(m)
+
+    # 高亮搜索车辆
+    if highlight_row is not None:
+        fg_hl = folium.FeatureGroup(name='起点/终点', show=True)
+        folium.Marker(
+            location=[highlight_row['lati'], highlight_row['long']],
+            popup=folium.Popup(
+                f"<b>车辆 {int(highlight_row['id'])}</b><br>"
+                f"状态：{'载客' if highlight_row['status']==1 else '空载'}<br>"
+                f"速度：{highlight_row['speed']} km/h", max_width=200),
+            icon=folium.Icon(color='red', icon='star'),
+            tooltip=f"车辆 {int(highlight_row['id'])}（已定位）",
+        ).add_to(fg_hl)
+        fg_hl.add_to(m)
+
+    # 框选范围静态显示
+    if bbox is not None:
+        south, north, west, east = bbox
+        folium.Rectangle(
+            bounds=[[south, west], [north, east]],
+            color='#9b5de5', weight=2.5, fill=True,
+            fill_color='#9b5de5', fill_opacity=0.06,
+            dash_array='6,4', tooltip='当前框选范围',
+        ).add_to(m)
+
+    # 深圳边界
+    boundary = load_shenzhen_boundary()
+    fg_boundary = folium.FeatureGroup(name='深圳市边界', show=True)
+    add_boundary_to_map(fg_boundary, boundary)
+    fg_boundary.add_to(m)
+
+    # 框选工具
+    if enable_draw:
+        Draw(
+            export=False,
+            draw_options={
+                'polyline': False, 'polygon': False, 'circle': False,
+                'marker': False, 'circlemarker': False,
+                'rectangle': {'shapeOptions': {'color': '#9b5de5'}},
+            },
+            edit_options={'edit': False, 'remove': True},
+        ).add_to(m)
+
+    folium.LayerControl(collapsed=False).add_to(m)
+    return m
+
+
+# ── Tab 2（原 Tab3）：地图选点 ────────────────────────────────────────
+
+def build_picker_map():
+    m = folium.Map(location=SHENZHEN_CENTER, zoom_start=11, tiles='OpenStreetMap')
+    add_boundary_to_map(m, load_shenzhen_boundary())
+    return m
+
+
+# ── Tab 3（原 Tab4）：多车轨迹动画对比 ───────────────────────────────
+
+def build_multi_vehicle_animation_html(vehicle_dfs, color_map, start_time, road_match=False):
+    vehicle_dfs = {vid: df for vid, df in vehicle_dfs.items() if len(df) > 0}
+    if not vehicle_dfs:
+        return None
+
+    all_lats = pd.concat([df['lati'] for df in vehicle_dfs.values()])
+    all_lons = pd.concat([df['long'] for df in vehicle_dfs.values()])
+    m = folium.Map(location=[all_lats.mean(), all_lons.mean()],
+                   zoom_start=12, tiles='OpenStreetMap')
+
+    vehicles_payload = []
+    max_elapsed = 0.0
+
+    for vid, df in vehicle_dfs.items():
+        color = color_map.get(vid, '#333333')
+        df = df.copy()
+        df['status_grp'] = (df['status'] != df['status'].shift()).cumsum()
+
+        fg_busy   = folium.FeatureGroup(name=f'车辆{vid}·载客轨迹', show=True)
+        fg_idle   = folium.FeatureGroup(name=f'车辆{vid}·空载轨迹', show=True)
+        fg_pickup = folium.FeatureGroup(name=f'车辆{vid}·上车点',   show=True)
+        fg_drop   = folium.FeatureGroup(name=f'车辆{vid}·下车点',   show=True)
+        fg_ep     = folium.FeatureGroup(name=f'车辆{vid}·起点/终点',show=True)
+
+        for _, seg in df.groupby('status_grp'):
+            if len(seg) < 2:
+                continue
+            pts = seg[['lati', 'long']].values.tolist()
+            if seg['status'].iloc[0] == 1:
+                folium.PolyLine(pts, color=color, weight=3, opacity=0.35,
+                                dash_array='4,6', tooltip=f'车辆{vid}·载客').add_to(fg_busy)
+            else:
+                folium.PolyLine(pts, color=color, weight=2, opacity=0.25,
+                                dash_array='2,8', tooltip=f'车辆{vid}·空载').add_to(fg_idle)
+
+        df['status_prev'] = df['status'].shift(1)
+        for _, row in df[(df['status'] == 1) & (df['status_prev'] == 0)].iterrows():
+            folium.CircleMarker([row['lati'], row['long']], radius=5,
+                                color=color, fill=True, fill_color='white',
+                                fill_opacity=0.9, weight=2.5,
+                                popup=f"上车 {row['time']}").add_to(fg_pickup)
+        for _, row in df[(df['status'] == 0) & (df['status_prev'] == 1)].iterrows():
+            folium.CircleMarker([row['lati'], row['long']], radius=5,
+                                color=color, fill=True, fill_color=color,
+                                fill_opacity=0.7, weight=2,
+                                popup=f"下车 {row['time']}").add_to(fg_drop)
+
+        folium.Marker([df.iloc[0]['lati'],  df.iloc[0]['long']],
+                      popup=f"起点 {df.iloc[0]['time']}",
+                      icon=folium.Icon(color='blue', icon='home')).add_to(fg_ep)
+        folium.Marker([df.iloc[-1]['lati'], df.iloc[-1]['long']],
+                      popup=f"终点 {df.iloc[-1]['time']}",
+                      icon=folium.Icon(color='black', icon='flag')).add_to(fg_ep)
+
+        for fg in (fg_busy, fg_idle, fg_pickup, fg_drop, fg_ep):
+            fg.add_to(m)
+
+        df = df.reset_index(drop=True)
+        pts_payload = []
+        for _, row in df.iterrows():
+            elapsed = (row['time'] - start_time).total_seconds()
+            pts_payload.append({
+                'lat': row['lati'], 'lng': row['long'],
+                'status': int(row['status']), 'speed': float(row['speed']),
+                'time': row['time'].strftime('%H:%M:%S'),
+                'elapsed': float(elapsed),
+            })
+        if pts_payload:
+            max_elapsed = max(max_elapsed, pts_payload[-1]['elapsed'])
+        vehicles_payload.append({'id': vid, 'color': color, 'points': pts_payload})
+
+    boundary = load_shenzhen_boundary()
+    fg_boundary = folium.FeatureGroup(name='深圳市边界', show=True)
+    add_boundary_to_map(fg_boundary, boundary)
+    fg_boundary.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+    add_road_match_banner(m, road_match)
+
+    target_play_seconds = 25
+    time_scale = (max_elapsed / target_play_seconds) if max_elapsed > 0 else 1.0
+    vehicles_json = json.dumps(vehicles_payload)
+    map_var = m.get_name()
+
+    legend_rows = ''.join(
+        f'<div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;'
+        f'background:{v["color"]};vertical-align:middle;margin-right:6px;"></span>车辆 {v["id"]}</div>'
+        for v in vehicles_payload
+    )
+    status_rows = ''.join(
+        f'<div id="status-{v["id"]}" style="margin-bottom:2px;">车辆{v["id"]}：等待播放</div>'
+        for v in vehicles_payload
+    )
+
+    anim = f'''
+    <div id="ctrl" style="position:fixed;bottom:30px;right:20px;z-index:9999;
+         background:rgba(255,255,255,0.96);padding:12px 16px;border-radius:10px;
+         box-shadow:0 2px 12px rgba(0,0,0,0.2);
+         font-family:'Microsoft YaHei',sans-serif;min-width:220px;max-width:260px;">
+        <div style="margin-bottom:10px;">
+            <button id="playBtn" style="padding:6px 14px;font-size:14px;cursor:pointer;
+                background:#2196F3;color:white;border:none;border-radius:6px;">▶ 播放对比动画</button>
+            <button id="resetBtn" style="padding:6px 14px;font-size:14px;cursor:pointer;
+                background:#6c757d;color:white;border:none;border-radius:6px;margin-left:6px;">⟲ 重置</button>
+        </div>
+        <div style="width:100%;height:5px;background:#e9ecef;border-radius:3px;margin-bottom:8px;">
+            <div id="prog" style="height:100%;width:0%;background:#2196F3;
+                 border-radius:3px;transition:width 0.1s;"></div>
+        </div>
+        <div style="border-top:1px solid #e9ecef;margin:6px 0 8px;"></div>
+        <div style="font-size:12px;color:#333;line-height:1.7;max-height:160px;overflow-y:auto;">
+            {status_rows}
+        </div>
+        <div style="border-top:1px solid #e9ecef;margin:8px 0 6px;"></div>
+        <div style="font-size:12px;color:#333;line-height:1.8;">{legend_rows}</div>
+    </div>
+    <script>
+    (function(){{
+        var vehicles={vehicles_json};
+        var timeScale={time_scale}, maxElapsed={max_elapsed};
+        var tickMs=50, playMs=0, ticker=null;
+        function waitMap(){{
+            if(typeof {map_var}==='undefined'){{setTimeout(waitMap,100);return;}}
+            var M={map_var};
+            vehicles.forEach(function(v){{
+                var html='<div style="width:22px;height:22px;border-radius:50%;border:3px solid '+
+                    v.color+';background:white;display:flex;align-items:center;'+
+                    'justify-content:center;font-size:12px;">🚕</div>';
+                v.marker=L.marker([v.points[0].lat,v.points[0].lng],
+                    {{icon:L.divIcon({{html:html,iconSize:[22,22],className:''}})}}).addTo(M);
+                v.trail=L.polyline([],{{color:v.color,weight:5,opacity:0.92}}).addTo(M);
+                v.idx=0;
+                v.el=document.getElementById('status-'+v.id);
+            }});
+            var prog=document.getElementById('prog');
+            var playBtn=document.getElementById('playBtn');
+            function done(){{return vehicles.every(function(v){{return v.idx>=v.points.length;}});}}
+            function tick(){{
+                playMs+=tickMs;
+                var re=(playMs/1000)*timeScale;
+                vehicles.forEach(function(v){{
+                    while(v.idx<v.points.length&&v.points[v.idx].elapsed<=re){{
+                        var p=v.points[v.idx];
+                        v.marker.setLatLng([p.lat,p.lng]);
+                        v.trail.addLatLng([p.lat,p.lng]);
+                        if(v.el)v.el.innerHTML='<b>车辆'+v.id+'</b>：'+p.time+
+                            ' · '+(p.status===1?'🔴载客':'🟢空载')+' · '+p.speed+'km/h';
+                        v.idx++;
+                    }}
+                }});
+                prog.style.width=Math.min(100,(re/maxElapsed*100))+'%';
+                if(re>=maxElapsed||done()){{
+                    clearInterval(ticker);ticker=null;
+                    playBtn.innerText='✅ 播放完成';prog.style.width='100%';
+                }}
+            }}
+            playBtn.onclick=function(){{
+                if(ticker)return;
+                this.innerText='⏸ 播放中...';
+                ticker=setInterval(tick,tickMs);
+            }};
+            document.getElementById('resetBtn').onclick=function(){{
+                clearInterval(ticker);ticker=null;playMs=0;
+                vehicles.forEach(function(v){{
+                    v.idx=0;
+                    v.marker.setLatLng([v.points[0].lat,v.points[0].lng]);
+                    v.trail.setLatLngs([]);
+                    if(v.el)v.el.innerHTML='车辆'+v.id+'：等待播放';
+                }});
+                prog.style.width='0%';playBtn.innerText='▶ 播放对比动画';
+            }};
+        }}
+        waitMap();
+    }})();
+    </script>'''
+
+    return m.get_root().render() + anim
+
+
+# ── main ─────────────────────────────────────────────────────────────
+
+def main():
+    st.set_page_config(page_title='出租车GPS查询系统', layout='wide')
+
+    st.markdown("""
+    <style>
+    #MainMenu{visibility:hidden;}
+    header[data-testid="stHeader"]{height:0;min-height:0;}
+    .block-container{padding-top:1rem !important;padding-bottom:0 !important;}
+    div[data-testid="stTabs"]>div:first-child{
+        background:transparent;padding:0;margin:0 0 .5rem;border-bottom:1px solid #e9ecef;}
+    div[data-testid="stTabs"] button[data-baseweb="tab"]{
+        font-size:14px !important;font-weight:400 !important;color:#666 !important;
+        padding:10px 20px !important;border:none !important;
+        border-bottom:3px solid transparent !important;
+        background:transparent !important;border-radius:0 !important;margin:0 !important;}
+    div[data-testid="stTabs"] button[data-baseweb="tab"]:hover{
+        color:#333 !important;background:#f5f5f5 !important;}
+    div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"]{
+        color:#E63946 !important;border-bottom:3px solid #E63946 !important;
+        font-weight:500 !important;background:transparent !important;}
+    div[data-testid="stTabs"]>div:first-child>div{border-bottom:none !important;gap:0 !important;}
+    </style>""", unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="display:flex;align-items:baseline;gap:12px;
+                padding:.5rem 0 .8rem;border-bottom:1px solid #e9ecef;margin-bottom:0;">
+        <span style="font-size:1.4rem;font-weight:600;">🚕 出租车GPS数据查询</span>
+        <span style="font-size:12px;color:#888;">深圳 · 2013-10-22</span>
+    </div>""", unsafe_allow_html=True)
+
+    tab1, tab2, tab3 = st.tabs([
+        '📍  全车位置查询', '🗺  地图选点（路网校正/ETA）', '🚦  多车轨迹动画对比',
+    ])
+
+    # ── Tab 1：全车位置查询 ─────────────────────────────────────────
+    with tab1:
+        col_ctrl, col_map = st.columns([1, 4])
+
+        with col_ctrl:
+            st.subheader('选择时间点')
+            query_time  = st.time_input('查询时刻', value=pd.Timestamp('08:00:00').time())
+            df_snapshot = load_minute_snapshot(query_time.hour, query_time.minute)
+
+            st.divider()
+            st.write('🖊️ 框选范围筛选')
+            st.caption('在右侧地图用矩形工具画一个区域，点击下方按钮即可只看区域内车辆')
+            current_bbox = st.session_state.get('fleet_bbox')
+            col_a, col_b = st.columns(2)
+            with col_a:
+                apply_bbox = st.button('✅ 应用框选范围', use_container_width=True)
+            with col_b:
+                if st.button('🗑 清除范围', use_container_width=True):
+                    st.session_state['fleet_bbox'] = None
+                    st.rerun()
+            if current_bbox:
+                st.caption(f'纬度[{current_bbox[0]:.4f}, {current_bbox[1]:.4f}]，'
+                           f'经度[{current_bbox[2]:.4f}, {current_bbox[3]:.4f}]')
+
+            df_display = filter_by_bbox(df_snapshot, current_bbox) if current_bbox else df_snapshot
+
+            st.divider()
+            st.metric('当前显示车辆总数', len(df_display))
+            if len(df_display) > 0:
+                st.metric('载客车辆数', int((df_display['status'] == 1).sum()))
+                st.metric('空载车辆数', int((df_display['status'] == 0).sum()))
+
+            st.divider()
+            st.write('🔍 查找指定车辆')
+            search_id = st.text_input('输入车辆id', placeholder='如：22223')
+            search_result = None
+            if search_id.strip():
+                matched = (df_snapshot[df_snapshot['id'] == int(search_id.strip())]
+                           if search_id.strip().isdigit() else pd.DataFrame())
+                if len(matched) > 0:
+                    search_result = matched.iloc[0]
+                    st.success(f"找到车辆 {search_id}")
+                    st.write(f"**状态**：{'载客' if search_result['status']==1 else '空载'}")
+                    st.write(f"**速度**：{search_result['speed']} km/h")
+                    st.write(f"**位置**：{search_result['lati']:.5f}, {search_result['long']:.5f}")
+                else:
+                    st.warning(f"该时刻未找到车辆 {search_id}，可能不在线")
+
+            st.divider()
+            st.caption('💡 点击地图可弹出最近车辆信息')
+
+        with col_map:
+            m1 = build_fleet_snapshot_map(df_display,
+                                           highlight_row=search_result,
+                                           bbox=current_bbox)
+            if m1 is not None:
+                map_data = st_folium(m1, width=None, height=650, key='fleet_map')
+
+                if apply_bbox and map_data:
+                    new_bbox = extract_bbox_from_drawing(map_data.get('last_active_drawing'))
+                    if new_bbox:
+                        st.session_state['fleet_bbox'] = new_bbox
+                        st.rerun()
+                    else:
+                        st.warning('未检测到矩形，请先在地图上画一个矩形区域')
+
+                if map_data and map_data.get('last_clicked'):
+                    clat = map_data['last_clicked']['lat']
+                    clng = map_data['last_clicked']['lng']
+                    nearest = find_nearest_vehicle(df_display, clat, clng)
+                    if nearest is not None:
+                        nid = str(int(nearest['id']))
+                        if st.session_state.get('clicked_vehicle') != nid:
+                            st.session_state['clicked_vehicle'] = nid
+                            st.session_state['selected_vehicle'] = nid
+                            st.rerun()
+                        st.success(f"已选中车辆：{nid}（"
+                                   f"{'载客' if nearest['status']==1 else '空载'}，"
+                                   f"{nearest['speed']}km/h）")
+            else:
+                st.info('该时刻没有数据')
+
+        # 点击车辆后动画回放
+        clicked_id = st.session_state.get('clicked_vehicle')
+        if clicked_id:
+            st.divider()
+            with st.expander(f'🎬 车辆 {clicked_id} 动画轨迹回放设置', expanded=True):
+                df_clicked_full = load_vehicle_data(clicked_id)
+                if len(df_clicked_full) == 0:
+                    st.warning('该车辆没有可用的轨迹数据')
+                else:
+                    min_t = df_clicked_full['time'].min()
+                    max_t = df_clicked_full['time'].max()
+                    default_start = pd.Timestamp.combine(min_t.date(), query_time)
+                    default_start = max(min(default_start, max_t), min_t)
+                    default_end   = min(default_start + pd.Timedelta(minutes=20), max_t)
+
+                    col_t1, col_t2, col_t3 = st.columns([2, 1, 1])
+                    with col_t1:
+                        anim_range = st.slider(
+                            '选择该车的动画播放时间范围',
+                            min_value=min_t.to_pydatetime(), max_value=max_t.to_pydatetime(),
+                            value=(default_start.to_pydatetime(), default_end.to_pydatetime()),
+                            format='HH:mm', step=pd.Timedelta(minutes=1),
+                            key='clicked_vehicle_time_range',
+                        )
+                    with col_t2:
+                        road_match_click = st.checkbox('启用路网校正', value=False,
+                                                        key='road_match_click',
+                                                        help='功能开发中')
+                    with col_t3:
+                        play_clicked = st.button('▶ 开始播放', key='play_clicked',
+                                                  use_container_width=True)
+
+                    if play_clicked:
+                        anim_start = pd.Timestamp(anim_range[0])
+                        anim_end   = pd.Timestamp(anim_range[1])
+                        df_anim = df_clicked_full[
+                            (df_clicked_full['time'] >= anim_start) &
+                            (df_clicked_full['time'] <= anim_end)
+                        ]
+                        if len(df_anim) == 0:
+                            st.info('所选时间范围内没有轨迹点，请调整范围')
+                        else:
+                            # 点击车辆的单车动画复用多车动画函数（单车传入）
+                            single_html = build_multi_vehicle_animation_html(
+                                {clicked_id: df_anim},
+                                {clicked_id: MULTI_VEHICLE_COLORS[0]},
+                                start_time=anim_start,
+                                road_match=road_match_click,
+                            )
+                            if single_html:
+                                components.html(single_html, height=700, scrolling=False)
+
+    # ── Tab 2：地图选点 ─────────────────────────────────────────────
+    with tab2:
+        st.subheader('点击地图选取坐标点')
+        st.caption('为后续路网校正（06阶段）与ETA预测（07阶段）预留接口')
+        col_p1, col_p2 = st.columns([1, 4])
+        with col_p2:
+            map_data3 = st_folium(build_picker_map(), width=None, height=800, key='picker_map')
+        with col_p1:
+            st.write('已选取的坐标：')
+            if map_data3 and map_data3.get('last_clicked'):
+                lat = map_data3['last_clicked']['lat']
+                lng = map_data3['last_clicked']['lng']
+                st.success(f'纬度：{lat:.6f}')
+                st.success(f'经度：{lng:.6f}')
+                st.code(f'[{lat:.6f}, {lng:.6f}]', language='python')
+            else:
+                st.info('请在地图上点击选取一个位置')
+
+    # ── Tab 3：多车轨迹动画对比 ─────────────────────────────────────
+    with tab3:
+        st.subheader('多车轨迹动画对比')
+        st.caption(f'各车以不同颜色同步播放，最多 {MAX_VEHICLES_FOR_ANIMATION} 辆')
+        col_c, col_m = st.columns([1, 3])
+        vehicle_dfs_full = None
+        range_start = range_end = None
+        color_map  = {}
+        play_multi = False
+
+        with col_c:
+            vehicle_ids_all = list_vehicle_ids()
+            selected_ids = st.multiselect(
+                '选择车辆id（可多选）', vehicle_ids_all,
+                default=vehicle_ids_all[:2] if len(vehicle_ids_all) >= 2 else vehicle_ids_all,
+            )
+            if len(selected_ids) > MAX_VEHICLES_FOR_ANIMATION:
+                st.warning(f'最多 {MAX_VEHICLES_FOR_ANIMATION} 辆，已自动截取')
+                selected_ids = selected_ids[:MAX_VEHICLES_FOR_ANIMATION]
+
+            road_match_4 = st.checkbox('启用路网校正', value=False,
+                                        key='road_match_tab4', help='功能开发中')
+
+            if not selected_ids:
+                st.info('请至少选择一辆车')
+            else:
+                vehicle_dfs_full = {vid: load_vehicle_data(vid) for vid in selected_ids}
+                vehicle_dfs_full = {vid: df for vid, df in vehicle_dfs_full.items() if len(df) > 0}
+
+                if not vehicle_dfs_full:
+                    st.warning('所选车辆均没有可用数据')
+                else:
+                    union_min = min(df['time'].min() for df in vehicle_dfs_full.values())
+                    union_max = max(df['time'].max() for df in vehicle_dfs_full.values())
+                    default_end = min(union_min + pd.Timedelta(minutes=20), union_max)
+
+                    shared_range = st.slider(
+                        '选择共同的时间范围',
+                        min_value=union_min.to_pydatetime(), max_value=union_max.to_pydatetime(),
+                        value=(union_min.to_pydatetime(), default_end.to_pydatetime()),
+                        format='HH:mm', step=pd.Timedelta(minutes=1),
+                    )
+                    st.caption('车辆越多，建议范围越短')
+                    range_start = pd.Timestamp(shared_range[0])
+                    range_end   = pd.Timestamp(shared_range[1])
+                    color_map   = {vid: MULTI_VEHICLE_COLORS[i % len(MULTI_VEHICLE_COLORS)]
+                                   for i, vid in enumerate(vehicle_dfs_full.keys())}
+
+                    st.divider()
+                    for vid, df in vehicle_dfs_full.items():
+                        n = len(df[(df['time'] >= range_start) & (df['time'] <= range_end)])
+                        st.markdown(
+                            f'<span style="display:inline-block;width:12px;height:12px;'
+                            f'border-radius:50%;background:{color_map[vid]};'
+                            f'vertical-align:middle;margin-right:6px;"></span>'
+                            f'车辆 {vid}：{n} 个轨迹点',
+                            unsafe_allow_html=True,
+                        )
+                    play_multi = st.button('▶ 生成并播放多车对比动画', use_container_width=True)
+
+        with col_m:
+            if play_multi and vehicle_dfs_full:
+                ranged = {
+                    vid: df[(df['time'] >= range_start) & (df['time'] <= range_end)]
+                    for vid, df in vehicle_dfs_full.items()
+                }
+                ranged = {vid: df for vid, df in ranged.items() if len(df) > 0}
+                if not ranged:
+                    st.info('所选时间范围内没有任何车辆的轨迹点')
+                else:
+                    html_multi = build_multi_vehicle_animation_html(
+                        ranged, color_map, start_time=range_start, road_match=road_match_4)
+                    if html_multi:
+                        components.html(html_multi, height=780, scrolling=False)
+            else:
+                st.info('设置好车辆与时间范围后，点击左侧按钮生成动画')
+
+
+if __name__ == '__main__':
+    main()
